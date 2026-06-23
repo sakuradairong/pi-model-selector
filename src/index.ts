@@ -176,25 +176,21 @@ function buildProviderList(ctx: ExtensionContext): Provider[] {
 
 function buildCostLabel(model: Model<Api>): string {
   const c = model.cost;
-  if (!c) return "free";
+  const ctxLabel = model.contextWindow ? formatContextWindow(model.contextWindow) : "";
+  if (!c) return ctxLabel ? `free · ${ctxLabel}` : "free";
 
-  const inputCost = c.input > 0 ? `$${c.input}` : "free";
-  const outputCost = c.output > 0 ? `$${c.output}` : "free";
-
-  const ctxWin = model.contextWindow;
-  const ctxLabel = ctxWin ? formatContextWindow(ctxWin) : "";
-
-  if (inputCost === "free" && outputCost === "free") {
-    return ctxLabel || "free";
-  }
-
-  if (inputCost === outputCost) {
-    return ctxLabel ? `$${c.input}/${ctxLabel}` : `$${c.input}`;
-  }
-
-  return ctxLabel
-    ? `${inputCost}/${outputCost} · ${ctxLabel}`
+  const inputCost = formatPrice(c.input);
+  const outputCost = formatPrice(c.output);
+  const priceLabel = inputCost === "free" && outputCost === "free"
+    ? "free"
     : `${inputCost}/${outputCost}`;
+
+  return ctxLabel ? `${priceLabel} · ${ctxLabel}` : priceLabel;
+}
+
+function formatPrice(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "free";
+  return `$${Number.isInteger(value) ? value : value.toFixed(3).replace(/0+$/, "").replace(/\.$/, "")}`;
 }
 
 function modelKey(model: Model<Api>): string {

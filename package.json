@@ -1,8 +1,16 @@
 {
   "name": "pi-model-selector",
   "version": "0.1.0",
-  "description": "Interactive provider-tabbed model selector extension for pi.",
+  "description": "Interactive provider-focused model selector extension for pi.",
   "type": "module",
+  "homepage": "https://github.com/sakuradairong/pi-model-selector#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sakuradairong/pi-model-selector.git"
+  },
+  "bugs": {
+    "url": "https://github.com/sakuradairong/pi-model-selector/issues"
+  },
   "keywords": [
     "pi-package",
     "pi",

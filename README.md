@@ -15,6 +15,7 @@ Interactive model selector for [pi](https://pi.dev/) with a provider-focused ter
 - Highlights the currently selected row
 - Marks current active model with `*`
 - Marks reasoning-capable models with `R`
+- Displays prices as `$input/$output · context`
 - Avoids overriding pi's built-in `/model` command
 
 ## UI preview
@@ -40,6 +41,12 @@ Interactive model selector for [pi](https://pi.dev/) with a provider-focused ter
 
 ```bash
 pi install git:github.com/sakuradairong/pi-model-selector
+```
+
+For a pinned install, use a release tag:
+
+```bash
+pi install git:github.com/sakuradairong/pi-model-selector@v0.1.0
 ```
 
 Then restart pi, or run:
