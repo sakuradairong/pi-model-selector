@@ -1,0 +1,24 @@
+{
+  "name": "pi-model-selector",
+  "version": "0.1.0",
+  "description": "Interactive provider-tabbed model selector extension for pi.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "model-selector",
+    "tui"
+  ],
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}
