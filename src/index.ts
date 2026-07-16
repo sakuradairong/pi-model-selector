@@ -1,14 +1,14 @@
 /**
- * pi-model-selector - Interactive model selection with tabbed provider UI.
+ * pi-model-selector - Interactive model selection with provider-focused TUI.
  *
  * Features:
- * - Tab bar for switching between providers (Tab / Shift+Tab)
- * - Arrow keys to navigate models (↑↓)
+ * - Provider switching with Tab / Shift+Tab
+ * - Model navigation with ↑ / ↓
  * - Enter to confirm selection
  * - Escape to cancel
- * - Shows cost, context window, and reasoning badges per model
- * - Marks unavailable models with LOCK
- * - Highlights the currently active model with ●
+ * - Shows only models available in the current pi environment
+ * - Highlights the active model and selected model separately
+ * - Displays cost, context window, and reasoning capability
  *
  * Usage:
  *   /model-selector    - open the selector
@@ -18,7 +18,6 @@
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type {
   ExtensionAPI,
-  ExtensionCommandContext,
   ExtensionContext,
   Theme,
   ThemeColor,
@@ -31,36 +30,45 @@ import {
 } from "@earendil-works/pi-tui";
 
 interface Provider {
-  name: string; // internal provider id (e.g., "anthropic")
-  displayName: string; // human-readable name
+  name: string;
+  displayName: string;
   models: ModelInfo[];
 }
 
 interface ModelInfo {
   model: Model<Api>;
-  name: string; // display name
-  cost: string; // e.g., "$3/$3 · 200K ctx" or "free" / "local"
+  name: string;
+  cost: string;
   reasoning: boolean;
-  available: boolean; // has API key configured
 }
 
-export default function (pi: ExtensionAPI) {
+interface SelectorState {
+  providers: Provider[];
+  currentProviderIndex: number;
+  modelIndex: number;
+  currentModelKey: string | undefined;
+  lastError?: string;
+}
+
+const COMMAND_DESCRIPTION = "Open custom interactive model selector";
+const MIN_DIALOG_WIDTH = 44;
+const MODEL_ROWS = 8;
+
+export default function modelSelectorExtension(pi: ExtensionAPI) {
   const handler = async (_args: string, ctx: ExtensionContext): Promise<void> => {
     await openModelSelector(ctx, pi);
   };
 
-  // Register commands. Do NOT register /model: pi treats built-in /model as
-  // a special interactive command, so extension shadowing is unreliable.
   pi.registerCommand("wow-model", {
-    description: "Open custom interactive model selector",
+    description: COMMAND_DESCRIPTION,
     handler,
   });
   pi.registerCommand("ms", {
-    description: "Open custom interactive model selector",
+    description: COMMAND_DESCRIPTION,
     handler,
   });
   pi.registerCommand("select-model", {
-    description: "Open custom interactive model selector",
+    description: COMMAND_DESCRIPTION,
     handler,
   });
   pi.registerCommand("model-selector", {
@@ -68,16 +76,14 @@ export default function (pi: ExtensionAPI) {
     handler,
   });
 
-  // Register shortcut: Ctrl+Shift+M opens selector.
-  // Avoid Ctrl+M: many terminals encode it as Enter, which can break prompt submission.
   pi.registerShortcut(Key.ctrlShift("m"), {
     description: "Open model selector",
-    handler: async (ctx) => {
+    handler: async (ctx: ExtensionContext) => {
       await openModelSelector(ctx, pi);
     },
   });
 
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", async (_event: unknown, ctx: ExtensionContext) => {
     if (ctx.mode === "tui") {
       ctx.ui.setStatus("pi-model-selector", ctx.ui.theme.fg("accent", "ms:/ms"));
     }
@@ -97,24 +103,21 @@ async function openModelSelector(
 
   const providers = buildProviderList(ctx);
   if (providers.length === 0) {
-    ctx.ui.notify("No registered/available models found", "warning");
+    ctx.ui.notify("No available models found", "warning");
     return;
   }
 
-  const currentModelKey = ctx.model ? modelKey(ctx.model) : undefined;
   const state: SelectorState = {
     providers,
     currentProviderIndex: 0,
     modelIndex: 0,
-    currentModelKey,
-    // Error to show after a failed selection attempt
+    currentModelKey: ctx.model ? modelKey(ctx.model) : undefined,
     lastError: undefined,
   };
 
-  // Ensure modelIndex points to the current model on first render
   ensureCurrentModelSelected(state);
 
-  await ctx.ui.custom<void>((tui, theme, _kb, done) => {
+  await ctx.ui.custom<void>((tui: { requestRender(): void }, theme: Theme, _kb: unknown, done: (value: void) => void) => {
     const component = new ModelSelectorComponent(state, theme, pi, ctx, done);
     return {
       render(width: number): string[] {
@@ -131,66 +134,66 @@ async function openModelSelector(
   });
 }
 
-// ─── Provider List Builder ────────────────────────────────────────────────────
-
 function buildProviderList(ctx: ExtensionContext): Provider[] {
-  // Show only models with configured auth/OAuth/API key. `getAll()` includes
-  // every built-in provider, which makes the selector noisy on installs with
-  // many packaged model definitions.
   const availableModels = ctx.modelRegistry.getAvailable();
-
   const byProvider = new Map<string, { displayName: string; models: ModelInfo[] }>();
 
   for (const model of availableModels) {
-    const key = model.provider;
-    if (!byProvider.has(key)) {
-      byProvider.set(key, {
-        displayName: ctx.modelRegistry.getProviderDisplayName(key),
+    const providerName = model.provider;
+    let provider = byProvider.get(providerName);
+
+    if (!provider) {
+      provider = {
+        displayName: ctx.modelRegistry.getProviderDisplayName(providerName),
         models: [],
-      });
+      };
+      byProvider.set(providerName, provider);
     }
 
-    const info: ModelInfo = {
+    provider.models.push({
       model,
       name: model.name ?? model.id,
       cost: buildCostLabel(model),
       reasoning: model.reasoning ?? false,
-      available: true,
-    };
-
-    byProvider.get(key)!.models.push(info);
+    });
   }
 
-  // Sort providers alphabetically by display name
-  const sorted = Array.from(byProvider.entries()).sort(([, aVal], [, bVal]) =>
-    aVal.displayName.localeCompare(bVal.displayName),
-  );
-
-  return sorted.map(([name, { displayName, models }]) => ({
-    name,
-    displayName,
-    // Sort models within each provider alphabetically
-    models: models.sort((a, b) => a.name.localeCompare(b.name)),
-  }));
+  return Array.from(byProvider.entries())
+    .sort(([, a], [, b]) => a.displayName.localeCompare(b.displayName))
+    .map(([name, provider]) => ({
+      name,
+      displayName: provider.displayName,
+      models: provider.models.sort((a, b) => a.name.localeCompare(b.name)),
+    }));
 }
 
 function buildCostLabel(model: Model<Api>): string {
-  const c = model.cost;
-  const ctxLabel = model.contextWindow ? formatContextWindow(model.contextWindow) : "";
-  if (!c) return ctxLabel ? `free · ${ctxLabel}` : "free";
+  const contextLabel = model.contextWindow ? formatContextWindow(model.contextWindow) : "";
+  const cost = model.cost;
 
-  const inputCost = formatPrice(c.input);
-  const outputCost = formatPrice(c.output);
+  if (!cost) {
+    return contextLabel ? `free · ${contextLabel}` : "free";
+  }
+
+  const inputCost = formatPrice(cost.input);
+  const outputCost = formatPrice(cost.output);
   const priceLabel = inputCost === "free" && outputCost === "free"
     ? "free"
     : `${inputCost}/${outputCost}`;
 
-  return ctxLabel ? `${priceLabel} · ${ctxLabel}` : priceLabel;
+  return contextLabel ? `${priceLabel} · ${contextLabel}` : priceLabel;
 }
 
 function formatPrice(value: number): string {
-  if (!Number.isFinite(value) || value <= 0) return "free";
-  return `$${Number.isInteger(value) ? value : value.toFixed(3).replace(/0+$/, "").replace(/\.$/, "")}`;
+  if (!Number.isFinite(value) || value <= 0) {
+    return "free";
+  }
+
+  const formatted = Number.isInteger(value)
+    ? String(value)
+    : value.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
+
+  return `$${formatted}`;
 }
 
 function modelKey(model: Model<Api>): string {
@@ -199,8 +202,8 @@ function modelKey(model: Model<Api>): string {
 
 function formatContextWindow(tokens: number): string {
   if (tokens >= 1_000_000) {
-    const m = tokens / 1_000_000;
-    return `${Number.isInteger(m) ? m : m.toFixed(1)}M ctx`;
+    const millions = tokens / 1_000_000;
+    return `${Number.isInteger(millions) ? millions : millions.toFixed(1)}M ctx`;
   }
   if (tokens >= 1_000) {
     return `${Math.round(tokens / 1_000)}K ctx`;
@@ -208,24 +211,17 @@ function formatContextWindow(tokens: number): string {
   return `${tokens} ctx`;
 }
 
-// ─── Selector State ───────────────────────────────────────────────────────────
-
-interface SelectorState {
-  providers: Provider[];
-  currentProviderIndex: number;
-  modelIndex: number;
-  currentModelKey: string | undefined;
-  lastError?: string;
-}
-
 function ensureCurrentModelSelected(state: SelectorState): void {
-  if (!state.currentModelKey) return;
+  if (!state.currentModelKey) {
+    return;
+  }
 
   for (let providerIndex = 0; providerIndex < state.providers.length; providerIndex++) {
     const provider = state.providers[providerIndex];
     const modelIndex = provider.models.findIndex(
-      (model) => modelKey(model.model) === state.currentModelKey,
+      (entry) => modelKey(entry.model) === state.currentModelKey,
     );
+
     if (modelIndex >= 0) {
       state.currentProviderIndex = providerIndex;
       state.modelIndex = modelIndex;
@@ -234,16 +230,14 @@ function ensureCurrentModelSelected(state: SelectorState): void {
   }
 }
 
-// ─── Model Selector Component ────────────────────────────────────────────────
-
 class ModelSelectorComponent {
   private readonly state: SelectorState;
   private readonly theme: Theme;
   private readonly pi: ExtensionAPI;
   private readonly ctx: ExtensionContext;
   private readonly onDone: (value: void) => void;
-  private cachedLines?: string[];
   private cachedWidth?: number;
+  private cachedLines?: string[];
 
   constructor(
     state: SelectorState,
@@ -265,57 +259,37 @@ class ModelSelectorComponent {
   }
 
   handleInput(data: string): void {
-    const s = this.state;
-
-    // Tab / Shift+Tab: switch provider
     if (matchesKey(data, Key.tab)) {
-      s.currentProviderIndex = (s.currentProviderIndex + 1) % s.providers.length;
-      s.modelIndex = 0;
-      s.lastError = undefined;
-      this.invalidate();
+      this.moveProvider(1);
       return;
     }
 
     if (matchesKey(data, Key.shift("tab"))) {
-      s.currentProviderIndex =
-        (s.currentProviderIndex - 1 + s.providers.length) % s.providers.length;
-      s.modelIndex = 0;
-      s.lastError = undefined;
-      this.invalidate();
+      this.moveProvider(-1);
       return;
     }
 
-    // Arrow keys: navigate model list
-    const provider = s.providers[s.currentProviderIndex];
-    if (!provider) return;
-
     if (matchesKey(data, Key.up)) {
-      s.modelIndex = Math.max(0, s.modelIndex - 1);
-      s.lastError = undefined;
-      this.invalidate();
+      this.moveModel(-1);
       return;
     }
 
     if (matchesKey(data, Key.down)) {
-      s.modelIndex = Math.min(provider.models.length - 1, s.modelIndex + 1);
-      s.lastError = undefined;
-      this.invalidate();
+      this.moveModel(1);
       return;
     }
 
-    // Enter: select model
     if (matchesKey(data, Key.enter)) {
-      const model = provider.models[s.modelIndex];
+      const provider = this.currentProvider();
+      const model = provider?.models[this.state.modelIndex];
       if (model) {
         void this.selectModel(model);
       }
       return;
     }
 
-    // Escape: cancel
     if (matchesKey(data, Key.escape)) {
       this.onDone();
-      return;
     }
   }
 
@@ -325,193 +299,333 @@ class ModelSelectorComponent {
     }
 
     const lines = this.buildLines(width);
-    this.cachedLines = lines;
     this.cachedWidth = width;
+    this.cachedLines = lines;
     return lines;
   }
 
-  private buildLines(width: number): string[] {
-    const s = this.state;
-    const safeWidth = Math.max(56, width);
-    const innerWidth = Math.max(1, safeWidth - 2);
-    const lines: string[] = [];
-    const provider = s.providers[s.currentProviderIndex];
-    const visibleRange = provider ? this.visibleModelRange(provider.models.length) : { start: 0, end: -1 };
+  private moveProvider(offset: number): void {
+    const state = this.state;
+    const count = state.providers.length;
+    if (count === 0) {
+      return;
+    }
 
-    lines.push(this.frameTop(safeWidth));
-    lines.push(
-      this.frameLine(
-        twoColumn(
-          this.styled("accent", this.bold("Model Selector")),
-          this.dim(`${s.providers.length} provider${s.providers.length === 1 ? "" : "s"}`),
-          innerWidth,
-        ),
-        innerWidth,
-      ),
-    );
-    lines.push(this.frameLine(this.buildProviderBar(innerWidth), innerWidth));
+    state.currentProviderIndex = (state.currentProviderIndex + offset + count) % count;
+    const provider = this.currentProvider();
+    state.modelIndex = Math.min(state.modelIndex, Math.max(0, (provider?.models.length ?? 1) - 1));
+    state.lastError = undefined;
+    this.invalidate();
+  }
+
+  private moveModel(offset: number): void {
+    const provider = this.currentProvider();
+    if (!provider || provider.models.length === 0) {
+      return;
+    }
+
+    this.state.modelIndex = clamp(this.state.modelIndex + offset, 0, provider.models.length - 1);
+    this.state.lastError = undefined;
+    this.invalidate();
+  }
+
+  private currentProvider(): Provider | undefined {
+    return this.state.providers[this.state.currentProviderIndex];
+  }
+
+  private buildLines(width: number): string[] {
+    const clampedWidth = Math.max(1, width);
+
+    if (clampedWidth < MIN_DIALOG_WIDTH) {
+      return this.renderTooNarrow(clampedWidth);
+    }
+
+    const innerWidth = clampedWidth - 2;
+    const provider = this.currentProvider();
+    const visibleRange = provider
+      ? this.visibleModelRange(provider.models.length)
+      : { start: 0, end: -1 };
+
+    const lines: string[] = [];
+    lines.push(this.frameTop(clampedWidth));
+    lines.push(this.frameLine(this.headerLine(innerWidth), innerWidth));
+    lines.push(this.frameLine(this.providerStrip(innerWidth), innerWidth));
+    lines.push(this.frameLine(this.providerMetaLine(innerWidth, provider), innerWidth));
+    lines.push(this.frameLine(this.summaryLine(innerWidth, provider, visibleRange), innerWidth));
+    lines.push(this.frameDivider(clampedWidth));
 
     if (provider) {
-      const modelRange = provider.models.length > 0
-        ? `${visibleRange.start + 1}-${visibleRange.end + 1}/${provider.models.length}`
-        : "0/0";
-      lines.push(
-        this.frameLine(
-          twoColumn(
-            this.dim(`Models ${modelRange}`),
-            this.dim(`selected ${Math.min(s.modelIndex + 1, provider.models.length)}/${provider.models.length}`),
-            innerWidth,
-          ),
-          innerWidth,
-        ),
-      );
-    }
+      lines.push(this.frameLine(this.sectionTitle("Models"), innerWidth));
+      lines.push(this.frameLine(this.tableHeader(innerWidth), innerWidth));
 
-    lines.push(this.frameDivider(safeWidth));
+      if (provider.models.length === 0) {
+        lines.push(this.frameLine(this.muted("No models available for this provider"), innerWidth));
+      } else {
+        if (visibleRange.start > 0) {
+          lines.push(this.frameLine(this.dim(`↑ ${visibleRange.start} more above`), innerWidth));
+        }
 
-    if (s.lastError) {
-      lines.push(this.frameLine(this.warning(`LOCK ${s.lastError} — select a different model`), innerWidth));
-      lines.push(this.frameDivider(safeWidth));
-    }
+        for (let index = visibleRange.start; index <= visibleRange.end; index++) {
+          const model = provider.models[index];
+          const isActive = modelKey(model.model) === this.state.currentModelKey;
+          const isSelected = index === this.state.modelIndex;
+          lines.push(this.frameLine(this.modelRow(model, isActive, isSelected, innerWidth), innerWidth));
+        }
 
-    lines.push(this.frameLine(this.buildListHeader(innerWidth), innerWidth));
-
-    if (provider && provider.models.length > 0) {
-      if (visibleRange.start > 0) {
-        lines.push(this.frameLine(this.dim(`  ... ${visibleRange.start} more above`), innerWidth));
+        const below = provider.models.length - visibleRange.end - 1;
+        if (below > 0) {
+          lines.push(this.frameLine(this.dim(`↓ ${below} more below`), innerWidth));
+        }
       }
 
-      for (let index = visibleRange.start; index <= visibleRange.end; index++) {
-        const model = provider.models[index];
-        const isActive = modelKey(model.model) === s.currentModelKey;
-        const isSelected = index === s.modelIndex;
-        lines.push(this.frameLine(this.buildModelLine(model, isActive, isSelected, innerWidth), innerWidth));
+      lines.push(this.frameDivider(clampedWidth));
+      lines.push(this.frameLine(this.sectionTitle("Selection"), innerWidth));
+      for (const detailLine of this.detailLines(provider, innerWidth)) {
+        lines.push(this.frameLine(detailLine, innerWidth));
       }
-
-      const below = provider.models.length - visibleRange.end - 1;
-      if (below > 0) {
-        lines.push(this.frameLine(this.dim(`  ... ${below} more below`), innerWidth));
-      }
-    } else {
-      lines.push(this.frameLine(this.muted("  (no models)"), innerWidth));
     }
 
-    lines.push(this.frameDivider(safeWidth));
-    const helpText = "Tab/Shift+Tab provider • Up/Down navigate • Enter select • Esc cancel";
-    lines.push(this.frameLine(centerText(this.dim(helpText), innerWidth), innerWidth));
-    lines.push(this.frameBottom(safeWidth));
+    if (this.state.lastError) {
+      lines.push(this.frameDivider(clampedWidth));
+      lines.push(this.frameLine(this.warning(`Failed: ${this.state.lastError}`), innerWidth));
+    }
 
-    return lines.map((line) => this.theme.bg("customMessageBg", line));
+    lines.push(this.frameDivider(clampedWidth));
+    lines.push(this.frameLine(this.helpLine(innerWidth), innerWidth));
+    lines.push(this.frameBottom(clampedWidth));
+
+    return lines.map((line) => this.theme.bg("customMessageBg", truncateToWidth(line, clampedWidth, "")));
   }
 
-  private buildProviderBar(width: number): string {
-    const s = this.state;
-    const total = s.providers.length;
-    const current = s.providers[s.currentProviderIndex];
-    if (!current) return "";
+  private renderTooNarrow(width: number): string[] {
+    const safeWidth = Math.max(1, width);
+    const innerWidth = Math.max(0, safeWidth - 2);
+    const lines = [
+      this.frameTop(safeWidth),
+      this.frameLine(this.styled("accent", this.bold("Model Selector")), innerWidth),
+      this.frameLine(this.warning(`Window too narrow (${safeWidth} cols)`), innerWidth),
+      this.frameLine(this.dim(`Resize to at least ${MIN_DIALOG_WIDTH} columns`), innerWidth),
+      this.frameBottom(safeWidth),
+    ];
+    return lines.map((line) => this.theme.bg("customMessageBg", truncateToWidth(line, safeWidth, "")));
+  }
 
-    const previous = total > 1
-      ? s.providers[(s.currentProviderIndex - 1 + total) % total]
-      : undefined;
-    const next = total > 1
-      ? s.providers[(s.currentProviderIndex + 1) % total]
-      : undefined;
-
-    const parts: string[] = [];
-    if (previous && previous.name !== current.name) {
-      parts.push(this.dim(`< ${truncatePlain(previous.displayName, 18)}`));
-    }
-
-    parts.push(
-      this.theme.inverse(
-        this.styled(
-          "accent",
-          this.bold(` ${s.currentProviderIndex + 1}/${total} ${truncatePlain(current.displayName, 30)} `),
-        ),
-      ),
+  private headerLine(width: number): string {
+    return twoColumn(
+      this.styled("accent", this.bold("Model Selector")),
+      this.dim(`${this.state.providers.length} provider${this.state.providers.length === 1 ? "" : "s"}`),
+      width,
     );
+  }
 
-    if (next && next.name !== current.name) {
-      parts.push(this.dim(`${truncatePlain(next.displayName, 18)} >`));
+  private providerStrip(width: number): string {
+    const providers = this.state.providers;
+    const currentIndex = this.state.currentProviderIndex;
+    const current = providers[currentIndex];
+    if (!current) {
+      return "";
     }
 
-    return centerText(truncateToWidth(parts.join("  "), width), width);
+    const fullSegments = providers.map((provider, index) => this.providerLabel(provider, index, index === currentIndex));
+    const fullLine = fullSegments.join(" ");
+    if (visibleWidth(fullLine) <= width) {
+      return fullLine;
+    }
+
+    const segments: string[] = [];
+    const hiddenLeft = currentIndex;
+    const hiddenRight = providers.length - currentIndex - 1;
+
+    if (hiddenLeft > 1) {
+      segments.push(this.dim(`← ${hiddenLeft} more`));
+    } else if (hiddenLeft === 1) {
+      segments.push(this.providerLabel(providers[currentIndex - 1], currentIndex - 1, false));
+    }
+
+    segments.push(this.providerLabel(current, currentIndex, true));
+
+    if (hiddenRight === 1) {
+      segments.push(this.providerLabel(providers[currentIndex + 1], currentIndex + 1, false));
+    } else if (hiddenRight > 1) {
+      segments.push(this.dim(`${hiddenRight} more →`));
+    }
+
+    return fitSegments(segments, width);
   }
 
-  private buildListHeader(width: number): string {
-    return twoColumn(this.dim("  MODEL"), this.dim("PRICE / CONTEXT"), width);
+  private providerLabel(provider: Provider, index: number, isCurrent: boolean): string {
+    const label = ` ${index + 1}. ${provider.displayName} `;
+    if (isCurrent) {
+      return this.theme.inverse(this.styled("accent", this.bold(label)));
+    }
+    return this.muted(label);
   }
 
-  private visibleModelRange(total: number): { start: number; end: number } {
-    const maxVisible = 10;
-    if (total <= 0) return { start: 0, end: -1 };
-    if (total <= maxVisible) return { start: 0, end: total - 1 };
+  private providerMetaLine(width: number, provider: Provider | undefined): string {
+    if (!provider) {
+      return this.muted("No provider selected");
+    }
 
-    const half = Math.floor(maxVisible / 2);
-    const start = Math.max(0, Math.min(this.state.modelIndex - half, total - maxVisible));
-    return { start, end: start + maxVisible - 1 };
+    return twoColumn(
+      this.dim(`Provider ${this.state.currentProviderIndex + 1}/${this.state.providers.length} • ${provider.displayName}`),
+      this.dim(`${provider.models.length} model${provider.models.length === 1 ? "" : "s"}`),
+      width,
+    );
   }
 
-  private buildModelLine(
-    model: ModelInfo,
-    isActive: boolean,
-    isSelected: boolean,
+  private summaryLine(
     width: number,
+    provider: Provider | undefined,
+    visibleRange: { start: number; end: number },
   ): string {
-    const cursor = isSelected ? ">" : " ";
-    const activeMark = isActive ? "*" : " ";
-    const unavailableMark = model.available ? "" : "LOCK ";
-    const reasoningMark = model.reasoning ? "R " : "";
+    if (!provider) {
+      return this.muted("No providers available");
+    }
 
-    const leftPlain = `${cursor}${activeMark} ${unavailableMark}${reasoningMark}${model.name}`;
-    const rightPlain = model.cost || "";
+    const total = provider.models.length;
+    const modelPosition = total === 0 ? "0/0" : `${this.state.modelIndex + 1}/${total}`;
+    const visibleLabel = total === 0
+      ? "0/0"
+      : `${visibleRange.start + 1}-${visibleRange.end + 1}/${total}`;
+    const activeLabel = this.state.currentModelKey?.startsWith(`${provider.name}/`)
+      ? this.styled("success", "active in provider")
+      : this.dim("active elsewhere");
 
-    const rightWidth = Math.min(26, Math.max(16, Math.floor(width * 0.34)));
-    const leftWidth = Math.max(8, width - rightWidth - 1);
+    return twoColumn(
+      this.dim(`${provider.displayName} • showing ${visibleLabel}`),
+      `${this.dim(`selected ${modelPosition}`)} ${activeLabel}`,
+      width,
+    );
+  }
 
-    const leftColor: ThemeColor = isActive ? "success" : isSelected ? "accent" : "text";
-    const left = this.styled(leftColor, truncateToWidth(leftPlain, leftWidth));
-    const right = this.dim(truncateToWidth(rightPlain, rightWidth));
-    const line = `${padVisible(left, leftWidth)} ${right.padStart(Math.max(0, rightWidth))}`;
+  private sectionTitle(label: string): string {
+    return this.styled("accent", this.bold(label.toUpperCase()));
+  }
+
+  private tableHeader(width: number): string {
+    const nameWidth = this.nameColumnWidth(width);
+    const priceWidth = this.priceColumnWidth(width);
+    return `${padVisible(this.dim("MARK MODEL"), nameWidth)} ${padVisible(this.dim("PRICE / CONTEXT"), priceWidth)}`;
+  }
+
+  private modelRow(model: ModelInfo, isActive: boolean, isSelected: boolean, width: number): string {
+    const nameWidth = this.nameColumnWidth(width);
+    const priceWidth = this.priceColumnWidth(width);
+
+    const selectedMark = isSelected ? this.styled("accent", "›") : this.dim(" ");
+    const activeMark = isActive ? this.styled("success", "●") : this.dim("·");
+    const reasoningMark = model.reasoning ? this.styled("warning", "R") : this.dim("·");
+    const markers = `${selectedMark}${activeMark}${reasoningMark}`;
+
+    let nameColor: ThemeColor = "text";
+    if (isSelected) {
+      nameColor = "accent";
+    } else if (isActive) {
+      nameColor = "success";
+    }
+
+    const leftText = `${markers} ${model.name}`;
+    const left = padVisible(this.styled(nameColor, truncateToWidth(leftText, nameWidth)), nameWidth);
+    const rightText = truncateToWidth(model.cost, priceWidth);
+    const right = alignRight(this.dim(rightText), priceWidth);
+    const line = `${left} ${right}`;
 
     return isSelected ? this.theme.bg("selectedBg", padVisible(line, width)) : line;
   }
 
+  private detailLines(provider: Provider, width: number): string[] {
+    const model = provider.models[this.state.modelIndex];
+    if (!model) {
+      return [this.muted("No model selected")];
+    }
+
+    const isActive = modelKey(model.model) === this.state.currentModelKey;
+    const status = isActive
+      ? this.styled("success", "active now")
+      : this.styled("accent", "press Enter to activate");
+    let capability = this.dim("Standard reasoning profile");
+    if (model.reasoning) {
+      capability = this.styled("warning", "Reasoning capable");
+    }
+
+    const selectedPosition = `${this.state.modelIndex + 1}/${provider.models.length}`;
+    const markerSummary = [
+      this.styled("accent", "› selected"),
+      this.styled("success", "● active"),
+      this.styled("warning", "R reasoning"),
+    ].join(this.dim(" • "));
+
+    return [
+      twoColumn(this.bold(model.name), status, width),
+      twoColumn(this.dim(`${provider.displayName} • model ${selectedPosition}`), capability, width),
+      this.dim(`${provider.name}/${model.model.id}`),
+      twoColumn(this.dim("Price / context"), this.bold(this.dim(model.cost)), width),
+      markerSummary,
+    ];
+  }
+
+  private helpLine(width: number): string {
+    return centerText(
+      this.dim("Tab/Shift+Tab provider • ↑↓ move • Enter select • Esc cancel"),
+      width,
+    );
+  }
+
+  private visibleModelRange(total: number): { start: number; end: number } {
+    if (total <= 0) {
+      return { start: 0, end: -1 };
+    }
+
+    if (total <= MODEL_ROWS) {
+      return { start: 0, end: total - 1 };
+    }
+
+    const half = Math.floor(MODEL_ROWS / 2);
+    const start = clamp(this.state.modelIndex - half, 0, total - MODEL_ROWS);
+    return { start, end: start + MODEL_ROWS - 1 };
+  }
+
+  private nameColumnWidth(width: number): number {
+    const priceWidth = this.priceColumnWidth(width);
+    return Math.max(12, width - priceWidth - 1);
+  }
+
+  private priceColumnWidth(width: number): number {
+    return clamp(Math.floor(width * 0.35), 16, 28);
+  }
+
   private frameTop(width: number): string {
-    return this.borderMuted(`+${"-".repeat(Math.max(0, width - 2))}+`);
+    return this.borderMuted(`┌${hsep(width - 2, "─")}┐`);
   }
 
   private frameDivider(width: number): string {
-    return this.borderMuted(`+${"-".repeat(Math.max(0, width - 2))}+`);
+    return this.borderMuted(`├${hsep(width - 2, "─")}┤`);
   }
 
   private frameBottom(width: number): string {
-    return this.borderMuted(`+${"-".repeat(Math.max(0, width - 2))}+`);
+    return this.borderMuted(`└${hsep(width - 2, "─")}┘`);
   }
 
   private frameLine(content: string, innerWidth: number): string {
-    const clipped = truncateToWidth(content, innerWidth);
-    const padded = padVisible(clipped, innerWidth);
-    return `${this.borderMuted("|")}${padded}${this.borderMuted("|")}`;
+    return `${this.borderMuted("│")}${padVisible(truncateToWidth(content, innerWidth, ""), innerWidth)}${this.borderMuted("│")}`;
   }
 
   private async selectModel(model: ModelInfo): Promise<void> {
-    const s = this.state;
-
     const success = await this.pi.setModel(model.model);
 
     if (success) {
+      this.state.currentModelKey = modelKey(model.model);
+      this.state.lastError = undefined;
+      this.invalidate();
       this.ctx.ui.notify(`Model selected: ${model.model.provider}/${model.model.id}`, "info");
       this.onDone();
-    } else {
-      // No API key or other failure — stay in selector, show error
-      s.lastError = `No API key for ${model.model.provider}/${model.name}`;
-      this.ctx.ui.notify(s.lastError, "warning");
-      this.invalidate();
+      return;
     }
-  }
 
-  // ─── Theme helpers (avoids verbose theme.fg(...) calls) ───────────────────
+    this.state.lastError = `${model.model.provider}/${model.model.id}`;
+    this.ctx.ui.notify(`Failed to select ${this.state.lastError}`, "warning");
+    this.invalidate();
+  }
 
   private styled(color: ThemeColor, text: string): string {
     return this.theme.fg(color, text);
@@ -538,30 +652,62 @@ class ModelSelectorComponent {
   }
 }
 
-function hsep(width: number): string {
-  return "-".repeat(Math.max(0, width));
+function hsep(width: number, char = "─"): string {
+  return char.repeat(Math.max(0, width));
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
 }
 
 function padVisible(text: string, width: number): string {
   const remaining = width - visibleWidth(text);
-  return remaining > 0 ? `${text}${" ".repeat(remaining)}` : text;
+  return remaining > 0 ? `${text}${" ".repeat(remaining)}` : truncateToWidth(text, width, "");
 }
 
-function truncatePlain(text: string, width: number): string {
-  return truncateToWidth(text, width);
+function alignRight(text: string, width: number): string {
+  const remaining = width - visibleWidth(text);
+  return remaining > 0 ? `${" ".repeat(remaining)}${text}` : truncateToWidth(text, width, "");
 }
 
 function centerText(text: string, width: number): string {
   const textWidth = visibleWidth(text);
-  if (textWidth >= width) return truncateToWidth(text, width);
-  const left = Math.floor((width - textWidth) / 2);
-  return `${" ".repeat(left)}${text}`;
+  if (textWidth >= width) {
+    return truncateToWidth(text, width, "");
+  }
+
+  const leftPad = Math.floor((width - textWidth) / 2);
+  return `${" ".repeat(leftPad)}${text}`;
 }
 
 function twoColumn(left: string, right: string, width: number): string {
   const rightWidth = visibleWidth(right);
   const leftWidth = Math.max(0, width - rightWidth - 1);
-  const clippedLeft = truncateToWidth(left, leftWidth);
+  const clippedLeft = truncateToWidth(left, leftWidth, "");
   const gap = Math.max(1, width - visibleWidth(clippedLeft) - rightWidth);
   return `${clippedLeft}${" ".repeat(gap)}${right}`;
+}
+
+function fitSegments(segments: string[], width: number): string {
+  if (segments.length === 0) {
+    return "";
+  }
+
+  const separator = " ";
+  let combined = segments.join(separator);
+  if (visibleWidth(combined) <= width) {
+    return combined;
+  }
+
+  const first = segments[0] ?? "";
+  if (segments.length === 1) {
+    return truncateToWidth(first, width, "");
+  }
+
+  const last = segments.at(-1) ?? "";
+  const middleCount = Math.max(0, segments.length - 2);
+  const summary = middleCount > 0 ? ` ${middleCount} more ` : " ";
+  combined = `${truncateToWidth(first, Math.max(8, Math.floor(width * 0.35)), "")}${separator}${summary}${separator}${truncateToWidth(last, Math.max(8, Math.floor(width * 0.25)), "")}`;
+
+  return truncateToWidth(combined, width, "");
 }
