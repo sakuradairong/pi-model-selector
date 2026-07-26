@@ -22,27 +22,30 @@ Interactive model selector for [pi](https://pi.dev/) with a provider-focused ter
 ## UI preview
 
 ```text
-┌──────────────────────────────────────────────────────────────┐
-│Model Selector                                     3 providers│
-│ 1. Anthropic   2. OpenAI   3. Google                          │
-│Provider 2/3 • OpenAI                                    18 models│
-│OpenAI • showing 1-8/18               selected 3/18 active in provider│
-├──────────────────────────────────────────────────────────────┤
-│MODELS                                                        │
-│MARK MODEL                                      PRICE / CONTEXT│
-│›●R gpt-5.2                                     $1.25/$10 · 400K│
-│ ·R gpt-5.2-codex                               $1.25/$10 · 400K│
-│ ·· gpt-4.1-mini                                  $0.4/$1.6 · 1M│
-├──────────────────────────────────────────────────────────────┤
-│SELECTION                                                     │
-│gpt-5.2                                             active now│
-│OpenAI • model 3/18                         Reasoning capable│
-│openai/gpt-5.2                                              │
-│Price / context                              $1.25/$10 · 400K│
-│› selected • ● active • R reasoning                         │
-├──────────────────────────────────────────────────────────────┤
-│  Tab/Shift+Tab provider • ↑↓ move • Enter select • Esc cancel │
-└──────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────┐
+│Model Selector                                       3 providers│
+│ 1. Anthropic   2. Google   3. OpenAI                           │
+│Provider 3/3 • OpenAI                                  15 models│
+│OpenAI • showing 1-8/15         selected 3/15 active in provider│
+├────────────────────────────────────────────────────────────────┤
+│MODELS                                                          │
+│MARK MODEL                                       PRICE / CONTEXT│
+│ ·· gpt-4.1-mini                              $0.4/$1.6 · 1M ctx│
+│ ●R gpt-5.2                                 $1.25/$10 · 400K ctx│
+│›·R gpt-5.2-codex                           $1.25/$10 · 400K ctx│
+│ ·· gpt-extra-0                             $1.25/$10 · 400K ctx│
+│ ·· gpt-extra-1                             $1.25/$10 · 400K ctx│
+│↓ 7 more below                                                  │
+├────────────────────────────────────────────────────────────────┤
+│SELECTION                                                       │
+│gpt-5.2-codex                            press Enter to activate│
+│OpenAI • model 3/15                            Reasoning capable│
+│openai/gpt-5.2-codex                                            │
+│Price / context                             $1.25/$10 · 400K ctx│
+│› selected • ● active • R reasoning                             │
+├────────────────────────────────────────────────────────────────┤
+│  Tab/Shift+Tab provider • ↑↓ move • Enter select • Esc cancel  │
+└────────────────────────────────────────────────────────────────┘
 ```
 
 ## Install

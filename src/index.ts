@@ -11,8 +11,8 @@
  * - Displays cost, context window, and reasoning capability
  *
  * Usage:
- *   /model-selector    - open the selector
- *   Ctrl+Shift+M       - open the selector
+ *   /ms, /wow-model, /select-model, /model-selector - open the selector
+ *   Ctrl+Shift+M                                    - open the selector
  */
 
 import type { Api, Model } from "@earendil-works/pi-ai";
@@ -25,6 +25,7 @@ import type {
 import {
   Key,
   matchesKey,
+  type TUI,
   truncateToWidth,
   visibleWidth,
 } from "@earendil-works/pi-tui";
@@ -45,7 +46,8 @@ interface ModelInfo {
 interface SelectorState {
   providers: Provider[];
   currentProviderIndex: number;
-  modelIndex: number;
+  /** Selected model index for each provider, parallel to `providers`. */
+  modelIndices: number[];
   currentModelKey: string | undefined;
   lastError?: string;
 }
@@ -53,6 +55,8 @@ interface SelectorState {
 const COMMAND_DESCRIPTION = "Open custom interactive model selector";
 const MIN_DIALOG_WIDTH = 44;
 const MODEL_ROWS = 8;
+/** Visible width of the `›●R` marker cluster in front of each model name. */
+const MARKER_WIDTH = 3;
 
 export default function modelSelectorExtension(pi: ExtensionAPI) {
   const handler = async (_args: string, ctx: ExtensionContext): Promise<void> => {
@@ -110,15 +114,15 @@ async function openModelSelector(
   const state: SelectorState = {
     providers,
     currentProviderIndex: 0,
-    modelIndex: 0,
+    modelIndices: providers.map(() => 0),
     currentModelKey: ctx.model ? modelKey(ctx.model) : undefined,
     lastError: undefined,
   };
 
   ensureCurrentModelSelected(state);
 
-  await ctx.ui.custom<void>((tui: { requestRender(): void }, theme: Theme, _kb: unknown, done: (value: void) => void) => {
-    const component = new ModelSelectorComponent(state, theme, pi, ctx, done);
+  await ctx.ui.custom<void>((tui: TUI, theme: Theme, _kb: unknown, done: (value: void) => void) => {
+    const component = new ModelSelectorComponent(state, theme, pi, ctx, tui, done);
     return {
       render(width: number): string[] {
         return component.render(width);
@@ -224,7 +228,7 @@ function ensureCurrentModelSelected(state: SelectorState): void {
 
     if (modelIndex >= 0) {
       state.currentProviderIndex = providerIndex;
-      state.modelIndex = modelIndex;
+      state.modelIndices[providerIndex] = modelIndex;
       return;
     }
   }
@@ -235,21 +239,26 @@ class ModelSelectorComponent {
   private readonly theme: Theme;
   private readonly pi: ExtensionAPI;
   private readonly ctx: ExtensionContext;
+  private readonly tui: TUI;
   private readonly onDone: (value: void) => void;
   private cachedWidth?: number;
   private cachedLines?: string[];
+  private closed = false;
+  private selecting = false;
 
   constructor(
     state: SelectorState,
     theme: Theme,
     pi: ExtensionAPI,
     ctx: ExtensionContext,
+    tui: TUI,
     onDone: (value: void) => void,
   ) {
     this.state = state;
     this.theme = theme;
     this.pi = pi;
     this.ctx = ctx;
+    this.tui = tui;
     this.onDone = onDone;
   }
 
@@ -259,6 +268,10 @@ class ModelSelectorComponent {
   }
 
   handleInput(data: string): void {
+    if (this.closed || this.selecting) {
+      return;
+    }
+
     if (matchesKey(data, Key.tab)) {
       this.moveProvider(1);
       return;
@@ -281,16 +294,33 @@ class ModelSelectorComponent {
 
     if (matchesKey(data, Key.enter)) {
       const provider = this.currentProvider();
-      const model = provider?.models[this.state.modelIndex];
+      const model = provider?.models[this.modelIndex()];
       if (model) {
+        this.selecting = true;
         void this.selectModel(model);
       }
       return;
     }
 
     if (matchesKey(data, Key.escape)) {
-      this.onDone();
+      this.close();
     }
+  }
+
+  private close(): void {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    this.onDone();
+  }
+
+  private modelIndex(): number {
+    return this.state.modelIndices[this.state.currentProviderIndex] ?? 0;
+  }
+
+  private setModelIndex(index: number): void {
+    this.state.modelIndices[this.state.currentProviderIndex] = index;
   }
 
   render(width: number): string[] {
@@ -313,7 +343,7 @@ class ModelSelectorComponent {
 
     state.currentProviderIndex = (state.currentProviderIndex + offset + count) % count;
     const provider = this.currentProvider();
-    state.modelIndex = Math.min(state.modelIndex, Math.max(0, (provider?.models.length ?? 1) - 1));
+    this.setModelIndex(clamp(this.modelIndex(), 0, Math.max(0, (provider?.models.length ?? 1) - 1)));
     state.lastError = undefined;
     this.invalidate();
   }
@@ -324,7 +354,7 @@ class ModelSelectorComponent {
       return;
     }
 
-    this.state.modelIndex = clamp(this.state.modelIndex + offset, 0, provider.models.length - 1);
+    this.setModelIndex(clamp(this.modelIndex() + offset, 0, provider.models.length - 1));
     this.state.lastError = undefined;
     this.invalidate();
   }
@@ -368,7 +398,7 @@ class ModelSelectorComponent {
         for (let index = visibleRange.start; index <= visibleRange.end; index++) {
           const model = provider.models[index];
           const isActive = modelKey(model.model) === this.state.currentModelKey;
-          const isSelected = index === this.state.modelIndex;
+          const isSelected = index === this.modelIndex();
           lines.push(this.frameLine(this.modelRow(model, isActive, isSelected, innerWidth), innerWidth));
         }
 
@@ -483,7 +513,7 @@ class ModelSelectorComponent {
     }
 
     const total = provider.models.length;
-    const modelPosition = total === 0 ? "0/0" : `${this.state.modelIndex + 1}/${total}`;
+    const modelPosition = total === 0 ? "0/0" : `${this.modelIndex() + 1}/${total}`;
     const visibleLabel = total === 0
       ? "0/0"
       : `${visibleRange.start + 1}-${visibleRange.end + 1}/${total}`;
@@ -505,7 +535,7 @@ class ModelSelectorComponent {
   private tableHeader(width: number): string {
     const nameWidth = this.nameColumnWidth(width);
     const priceWidth = this.priceColumnWidth(width);
-    return `${padVisible(this.dim("MARK MODEL"), nameWidth)} ${padVisible(this.dim("PRICE / CONTEXT"), priceWidth)}`;
+    return `${padVisible(this.dim("MARK MODEL"), nameWidth)} ${alignRight(this.dim("PRICE / CONTEXT"), priceWidth)}`;
   }
 
   private modelRow(model: ModelInfo, isActive: boolean, isSelected: boolean, width: number): string {
@@ -524,8 +554,11 @@ class ModelSelectorComponent {
       nameColor = "success";
     }
 
-    const leftText = `${markers} ${model.name}`;
-    const left = padVisible(this.styled(nameColor, truncateToWidth(leftText, nameWidth)), nameWidth);
+    // Colour the name on its own: `markers` already closes its own colour spans,
+    // so wrapping both together would reset the name back to the default colour.
+    const nameText = truncateToWidth(model.name, Math.max(0, nameWidth - MARKER_WIDTH - 1));
+    const leftText = `${markers} ${this.styled(nameColor, nameText)}`;
+    const left = padVisible(leftText, nameWidth);
     const rightText = truncateToWidth(model.cost, priceWidth);
     const right = alignRight(this.dim(rightText), priceWidth);
     const line = `${left} ${right}`;
@@ -534,7 +567,7 @@ class ModelSelectorComponent {
   }
 
   private detailLines(provider: Provider, width: number): string[] {
-    const model = provider.models[this.state.modelIndex];
+    const model = provider.models[this.modelIndex()];
     if (!model) {
       return [this.muted("No model selected")];
     }
@@ -548,7 +581,7 @@ class ModelSelectorComponent {
       capability = this.styled("warning", "Reasoning capable");
     }
 
-    const selectedPosition = `${this.state.modelIndex + 1}/${provider.models.length}`;
+    const selectedPosition = `${this.modelIndex() + 1}/${provider.models.length}`;
     const markerSummary = [
       this.styled("accent", "› selected"),
       this.styled("success", "● active"),
@@ -581,7 +614,7 @@ class ModelSelectorComponent {
     }
 
     const half = Math.floor(MODEL_ROWS / 2);
-    const start = clamp(this.state.modelIndex - half, 0, total - MODEL_ROWS);
+    const start = clamp(this.modelIndex() - half, 0, total - MODEL_ROWS);
     return { start, end: start + MODEL_ROWS - 1 };
   }
 
@@ -611,20 +644,33 @@ class ModelSelectorComponent {
   }
 
   private async selectModel(model: ModelInfo): Promise<void> {
-    const success = await this.pi.setModel(model.model);
+    const label = `${model.model.provider}/${model.model.id}`;
 
-    if (success) {
-      this.state.currentModelKey = modelKey(model.model);
-      this.state.lastError = undefined;
+    try {
+      const success = await this.pi.setModel(model.model);
+
+      if (success) {
+        this.state.currentModelKey = modelKey(model.model);
+        this.state.lastError = undefined;
+        this.invalidate();
+        this.ctx.ui.notify(`Model selected: ${label}`, "info");
+        this.close();
+        return;
+      }
+
+      this.state.lastError = label;
+      this.ctx.ui.notify(`Failed to select ${label}`, "warning");
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      this.state.lastError = `${label} (${reason})`;
+      this.ctx.ui.notify(`Failed to select ${label}: ${reason}`, "error");
+    } finally {
+      this.selecting = false;
       this.invalidate();
-      this.ctx.ui.notify(`Model selected: ${model.model.provider}/${model.model.id}`, "info");
-      this.onDone();
-      return;
+      // setModel resolves after the keypress that triggered it, so ask the TUI
+      // to repaint instead of waiting for the next input event.
+      this.tui.requestRender();
     }
-
-    this.state.lastError = `${model.model.provider}/${model.model.id}`;
-    this.ctx.ui.notify(`Failed to select ${this.state.lastError}`, "warning");
-    this.invalidate();
   }
 
   private styled(color: ThemeColor, text: string): string {
