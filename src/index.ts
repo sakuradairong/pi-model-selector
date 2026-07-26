@@ -105,6 +105,11 @@ async function openModelSelector(
     return;
   }
 
+  // models.json can change while an interactive pi session remains open.
+  // Refresh before taking the synchronous snapshot so newly configured
+  // providers appear in /ms without requiring a full pi restart.
+  await ctx.modelRegistry.refresh();
+
   const providers = buildProviderList(ctx);
   if (providers.length === 0) {
     ctx.ui.notify("No available models found", "warning");
