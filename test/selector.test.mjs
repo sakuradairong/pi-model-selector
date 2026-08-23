@@ -27,6 +27,8 @@ const KITTY_A = "\x1b[97u";
 const KITTY_BACKSPACE = "\x1b[127u";
 const KITTY_CTRL_U = "\x1b[117;5u";
 const KITTY_ENTER = "\x1b[13u";
+const PASTE_START = "\x1b[200~";
+const PASTE_END = "\x1b[201~";
 
 function makeModel(provider, id, extra = {}) {
   return {
@@ -240,6 +242,21 @@ test("kitty CSI-u printable characters feed the filter", () => {
   assert.equal(component.filterText, "a");
 });
 
+test("bracketed paste feeds the filter in single or multiple chunks", () => {
+  const singleChunk = makeComponent().component;
+  singleChunk.handleInput(`${PASTE_START}gpt-5.2${PASTE_END}`);
+  assert.match(singleChunk.render(80).join("\n"), /Filter gpt-5\.2/);
+
+  const multipleChunks = makeComponent().component;
+  multipleChunks.handleInput(`${PASTE_START}gpt`);
+  multipleChunks.handleInput(`-5.2${PASTE_END}`);
+  assert.match(multipleChunks.render(80).join("\n"), /Filter gpt-5\.2/);
+
+  const adjacentInput = makeComponent().component;
+  adjacentInput.handleInput(`a${PASTE_START}gpt${PASTE_END}z`);
+  assert.match(adjacentInput.render(80).join("\n"), /Filter agptz/);
+});
+
 test("control characters never start the filter", () => {
   const { component } = makeComponent();
 
@@ -347,6 +364,17 @@ test("backspace edits the filter and deactivates it when empty", () => {
   assert.equal(component.filterText.length, 0);
 });
 
+test("backspace removes a complete Unicode grapheme", () => {
+  const { component } = makeComponent();
+
+  component.handleInput("👨‍👩‍👧‍👦");
+  component.handleInput(BACKSPACE);
+
+  const text = component.render(80).join("\n");
+  assert.doesNotMatch(text, /SEARCH RESULTS/);
+  assert.match(text, /type to filter/);
+});
+
 test("ctrl+u clears the whole filter", () => {
   const { component } = makeComponent();
 
@@ -425,6 +453,18 @@ test("render shows the filter line, match count, and provider tags", () => {
   assert.match(text, /OpenAI gpt-5\.2/);
   assert.match(text, /active now/);
   assert.match(text, /Esc clear filter/);
+});
+
+test("render keeps the end of a long filter visible", () => {
+  const { component } = makeComponent();
+
+  component.handleInput(
+    "this-is-a-very-long-filter-query-that-exceeds-the-dialog-width",
+  );
+
+  const filterLine = component.render(44).find((line) => line.includes("Filter"));
+  assert.ok(filterLine);
+  assert.match(filterLine, /dialog-width/);
 });
 
 test("render shows a no-match message for an empty result set", () => {

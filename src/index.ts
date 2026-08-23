@@ -28,6 +28,7 @@ import {
   Key,
   decodeKittyPrintable,
   matchesKey,
+  sliceByColumn,
   type TUI,
   truncateToWidth,
   visibleWidth,
@@ -67,6 +68,11 @@ const MIN_DIALOG_WIDTH = 44;
 const MODEL_ROWS = 8;
 /** Visible width of the `›●R` marker cluster in front of each model name. */
 const MARKER_WIDTH = 3;
+const BRACKETED_PASTE_START = "\x1b[200~";
+const BRACKETED_PASTE_END = "\x1b[201~";
+const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, {
+  granularity: "grapheme",
+});
 
 export default function modelSelectorExtension(pi: ExtensionAPI) {
   const handler = async (
@@ -380,6 +386,8 @@ export class ModelSelectorComponent {
   private selecting = false;
   private filterText = "";
   private searchCursor = 0;
+  private pasteBuffer = "";
+  private isInPaste = false;
 
   constructor(
     state: SelectorState,
@@ -404,6 +412,10 @@ export class ModelSelectorComponent {
 
   handleInput(data: string): void {
     if (this.closed || this.selecting) {
+      return;
+    }
+
+    if (this.handleBracketedPaste(data)) {
       return;
     }
 
@@ -452,6 +464,44 @@ export class ModelSelectorComponent {
     if (matchesKey(data, Key.escape)) {
       this.close();
     }
+  }
+
+  private handleBracketedPaste(data: string): boolean {
+    const startIndex = data.indexOf(BRACKETED_PASTE_START);
+    if (!this.isInPaste && startIndex === -1) {
+      return false;
+    }
+
+    if (!this.isInPaste) {
+      this.isInPaste = true;
+      this.pasteBuffer = data.slice(0, startIndex);
+      data = data.slice(startIndex + BRACKETED_PASTE_START.length);
+    }
+
+    this.pasteBuffer += data;
+    const endIndex = this.pasteBuffer.indexOf(BRACKETED_PASTE_END);
+    if (endIndex === -1) {
+      return true;
+    }
+
+    const pastedText = this.pasteBuffer
+      .slice(0, endIndex)
+      .replace(/\r\n/g, "")
+      .replace(/[\r\n]/g, "")
+      .replace(/\t/g, "    ");
+    const remaining = this.pasteBuffer.slice(
+      endIndex + BRACKETED_PASTE_END.length,
+    );
+    this.isInPaste = false;
+    this.pasteBuffer = "";
+
+    if (pastedText && isFilterableText(pastedText)) {
+      this.appendFilterText(pastedText);
+    }
+    if (remaining) {
+      this.handleInput(remaining);
+    }
+    return true;
   }
 
   private handleFilterInput(data: string): void {
@@ -538,7 +588,12 @@ export class ModelSelectorComponent {
     if (this.filterText.length === 0) {
       return;
     }
-    this.setFilterText([...this.filterText].slice(0, -1).join(""));
+
+    let lastGraphemeStart = 0;
+    for (const segment of GRAPHEME_SEGMENTER.segment(this.filterText)) {
+      lastGraphemeStart = segment.index;
+    }
+    this.setFilterText(this.filterText.slice(0, lastGraphemeStart));
   }
 
   private clearFilter(): void {
@@ -684,37 +739,18 @@ export class ModelSelectorComponent {
           ),
         );
       } else {
-        if (visibleRange.start > 0) {
-          lines.push(
-            this.frameLine(
-              this.dim(`↑ ${visibleRange.start} more above`),
-              innerWidth,
-            ),
-          );
-        }
-
-        for (
-          let index = visibleRange.start;
-          index <= visibleRange.end;
-          index++
-        ) {
-          const model = provider.models[index];
-          const isActive = modelKey(model.model) === this.state.currentModelKey;
-          const isSelected = index === this.modelIndex();
-          lines.push(
-            this.frameLine(
-              this.modelRow(model, isActive, isSelected, innerWidth),
-              innerWidth,
-            ),
-          );
-        }
-
-        const below = provider.models.length - visibleRange.end - 1;
-        if (below > 0) {
-          lines.push(
-            this.frameLine(this.dim(`↓ ${below} more below`), innerWidth),
-          );
-        }
+        this.appendWindowRows({
+          lines,
+          items: provider.models,
+          visibleRange,
+          innerWidth,
+          renderRow: (model, index) => {
+            const isActive =
+              modelKey(model.model) === this.state.currentModelKey;
+            const isSelected = index === this.modelIndex();
+            return this.modelRow(model, isActive, isSelected, innerWidth);
+          },
+        });
       }
 
       lines.push(this.frameDivider(width));
@@ -755,33 +791,14 @@ export class ModelSelectorComponent {
       );
     } else {
       const visibleRange = this.visibleRangeFor(this.searchCursor, hits.length);
-
-      if (visibleRange.start > 0) {
-        lines.push(
-          this.frameLine(
-            this.dim(`↑ ${visibleRange.start} more above`),
-            innerWidth,
-          ),
-        );
-      }
-
-      for (let index = visibleRange.start; index <= visibleRange.end; index++) {
-        const hit = hits[index];
-        const isSelected = index === this.searchCursor;
-        lines.push(
-          this.frameLine(
-            this.searchRow(hit, isSelected, innerWidth),
-            innerWidth,
-          ),
-        );
-      }
-
-      const below = hits.length - visibleRange.end - 1;
-      if (below > 0) {
-        lines.push(
-          this.frameLine(this.dim(`↓ ${below} more below`), innerWidth),
-        );
-      }
+      this.appendWindowRows({
+        lines,
+        items: hits,
+        visibleRange,
+        innerWidth,
+        renderRow: (hit, index) =>
+          this.searchRow(hit, index === this.searchCursor, innerWidth),
+      });
     }
 
     lines.push(this.frameDivider(width));
@@ -801,6 +818,42 @@ export class ModelSelectorComponent {
       }
     } else {
       lines.push(this.frameLine(this.muted("No model selected"), innerWidth));
+    }
+  }
+
+  private appendWindowRows<T>({
+    lines,
+    items,
+    visibleRange,
+    innerWidth,
+    renderRow,
+  }: {
+    lines: string[];
+    items: T[];
+    visibleRange: { start: number; end: number };
+    innerWidth: number;
+    renderRow: (item: T, index: number) => string;
+  }): void {
+    if (visibleRange.start > 0) {
+      lines.push(
+        this.frameLine(
+          this.dim(`↑ ${visibleRange.start} more above`),
+          innerWidth,
+        ),
+      );
+    }
+
+    for (let index = visibleRange.start; index <= visibleRange.end; index++) {
+      lines.push(
+        this.frameLine(renderRow(items[index], index), innerWidth),
+      );
+    }
+
+    const below = items.length - visibleRange.end - 1;
+    if (below > 0) {
+      lines.push(
+        this.frameLine(this.dim(`↓ ${below} more below`), innerWidth),
+      );
     }
   }
 
@@ -844,7 +897,23 @@ export class ModelSelectorComponent {
     const matchLabel = this.dim(
       `${hitCount} match${hitCount === 1 ? "" : "es"}`,
     );
-    return twoColumn(`${label} ${this.filterText}${cursor}`, matchLabel, width);
+    const prefix = `${label} `;
+    const leftWidth = Math.max(0, width - visibleWidth(matchLabel) - 1);
+    const filterWidth = Math.max(
+      0,
+      leftWidth - visibleWidth(prefix) - visibleWidth(cursor),
+    );
+    const totalFilterWidth = visibleWidth(this.filterText);
+    const visibleFilter =
+      totalFilterWidth <= filterWidth
+        ? this.filterText
+        : sliceByColumn(
+            this.filterText,
+            totalFilterWidth - filterWidth,
+            filterWidth,
+            true,
+          );
+    return twoColumn(`${prefix}${visibleFilter}${cursor}`, matchLabel, width);
   }
 
   private providerStrip(width: number): string {
