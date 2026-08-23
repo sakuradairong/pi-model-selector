@@ -7,7 +7,9 @@ Interactive model selector for [pi](https://pi.dev/) with a provider-focused ter
 ## Features
 
 - Provider-focused navigation with `Tab` / `Shift+Tab`
-- Model navigation with `↑` / `↓`
+- Model navigation with `↑` / `↓` (wraps around at both ends of the list)
+- Incremental filtering: type any text to search model names across all providers
+- `Backspace` edits the filter, `Ctrl+U` clears it, `Esc` clears it before closing
 - Confirm selection with `Enter`
 - Cancel with `Esc`
 - Shows only available models from `ctx.modelRegistry.getAvailable()`
@@ -44,9 +46,39 @@ Interactive model selector for [pi](https://pi.dev/) with a provider-focused ter
 │Price / context                             $1.25/$10 · 400K ctx│
 │› selected • ● active • R reasoning                             │
 ├────────────────────────────────────────────────────────────────┤
-│  Tab/Shift+Tab provider • ↑↓ move • Enter select • Esc cancel  │
+│  Tab/Shift+Tab provider • ↑↓ move • type to filter • Enter select│
 └────────────────────────────────────────────────────────────────┘
 ```
+
+### Filter mode
+
+Typing any text switches the selector into a cross-provider search view:
+
+```text
+┌────────────────────────────────────────────────────────────────┐
+│Model Selector                                       3 providers│
+│Filter gp                                                    4 matches│
+├────────────────────────────────────────────────────────────────┤
+│SEARCH RESULTS                                                  │
+│MARK MODEL                                       PRICE / CONTEXT│
+│›·· OpenAI gpt-4.1-mini                      $0.4/$1.6 · 1M ctx│
+│ ·R OpenAI gpt-5.2                          $1.25/$10 · 400K ctx│
+│ ·R OpenAI gpt-5.2-codex                    $1.25/$10 · 400K ctx│
+│ ·R Google gemini-3-pro                      $2/$12 · 1M ctx│
+├────────────────────────────────────────────────────────────────┤
+│SELECTION                                                       │
+│gpt-4.1-mini                            press Enter to activate│
+│OpenAI • result 1/4                     Standard reasoning profile│
+│openai/gpt-4.1-mini                                            │
+│Price / context                       $0.4/$1.6 · 1M ctx│
+│› selected • ● active • R reasoning                             │
+├────────────────────────────────────────────────────────────────┤
+│ ↑↓ move • Backspace edit • Ctrl+U clear • Enter select • Esc clear filter│
+└────────────────────────────────────────────────────────────────┘
+```
+
+The filter matches (case-insensitively) against the provider display name,
+provider name, model name, model id, and `provider/id` key.
 
 ## Install
 
@@ -103,9 +135,12 @@ Keyboard controls inside the selector:
 | --- | --- |
 | `Tab` | Next provider |
 | `Shift+Tab` | Previous provider |
-| `↑` / `↓` | Move through models |
+| `↑` / `↓` | Move through models (wraps around at both ends) |
+| Any printable text | Filter models across all providers |
+| `Backspace` | Edit the filter text |
+| `Ctrl+U` | Clear the filter |
 | `Enter` | Select model |
-| `Esc` | Cancel |
+| `Esc` | Clear the filter first, then cancel |
 
 A shortcut is also registered:
 
@@ -144,6 +179,12 @@ Local test:
 
 ```bash
 pi -e ./src/index.ts
+```
+
+Run the test suite (uses Node's built-in test runner, no build step needed):
+
+```bash
+node --test test/selector.test.mjs
 ```
 
 ## License

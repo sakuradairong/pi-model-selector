@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "Interactive provider-focused model selector extension for pi.",
   "type": "module",
+  "scripts": {
+    "test": "node --test test/selector.test.mjs"
+  },
   "homepage": "https://github.com/sakuradairong/pi-model-selector#readme",
   "repository": {
     "type": "git",

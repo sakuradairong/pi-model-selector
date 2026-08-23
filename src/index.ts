@@ -3,7 +3,9 @@
  *
  * Features:
  * - Provider switching with Tab / Shift+Tab
- * - Model navigation with ↑ / ↓
+ * - Model navigation with ↑ / ↓ (wraps around at both ends of the list)
+ * - Incremental filtering: type any text to search models across all providers
+ * - Backspace edits the filter, Ctrl+U clears it, Esc clears it before closing
  * - Enter to confirm selection
  * - Escape to cancel
  * - Shows only models available in the current pi environment
@@ -24,6 +26,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import {
   Key,
+  decodeKittyPrintable,
   matchesKey,
   type TUI,
   truncateToWidth,
@@ -43,6 +46,13 @@ interface ModelInfo {
   reasoning: boolean;
 }
 
+/** A model that matches the active filter, plus where it came from. */
+interface SearchHit {
+  providerIndex: number;
+  modelIndex: number;
+  model: ModelInfo;
+}
+
 interface SelectorState {
   providers: Provider[];
   currentProviderIndex: number;
@@ -59,7 +69,10 @@ const MODEL_ROWS = 8;
 const MARKER_WIDTH = 3;
 
 export default function modelSelectorExtension(pi: ExtensionAPI) {
-  const handler = async (_args: string, ctx: ExtensionContext): Promise<void> => {
+  const handler = async (
+    _args: string,
+    ctx: ExtensionContext,
+  ): Promise<void> => {
     await openModelSelector(ctx, pi);
   };
 
@@ -89,7 +102,10 @@ export default function modelSelectorExtension(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event: unknown, ctx: ExtensionContext) => {
     if (ctx.mode === "tui") {
-      ctx.ui.setStatus("pi-model-selector", ctx.ui.theme.fg("accent", "ms:/ms"));
+      ctx.ui.setStatus(
+        "pi-model-selector",
+        ctx.ui.theme.fg("accent", "ms:/ms"),
+      );
     }
   });
 }
@@ -100,7 +116,10 @@ async function openModelSelector(
 ): Promise<void> {
   if (ctx.mode !== "tui") {
     if (ctx.hasUI) {
-      ctx.ui.notify("Model selector UI is only available in interactive TUI mode", "warning");
+      ctx.ui.notify(
+        "Model selector UI is only available in interactive TUI mode",
+        "warning",
+      );
     }
     return;
   }
@@ -126,26 +145,38 @@ async function openModelSelector(
 
   ensureCurrentModelSelected(state);
 
-  await ctx.ui.custom<void>((tui: TUI, theme: Theme, _kb: unknown, done: (value: void) => void) => {
-    const component = new ModelSelectorComponent(state, theme, pi, ctx, tui, done);
-    return {
-      render(width: number): string[] {
-        return component.render(width);
-      },
-      invalidate(): void {
-        component.invalidate();
-      },
-      handleInput(data: string): void {
-        component.handleInput(data);
-        tui.requestRender();
-      },
-    };
-  });
+  await ctx.ui.custom<void>(
+    (tui: TUI, theme: Theme, _kb: unknown, done: (value: void) => void) => {
+      const component = new ModelSelectorComponent(
+        state,
+        theme,
+        pi,
+        ctx,
+        tui,
+        done,
+      );
+      return {
+        render(width: number): string[] {
+          return component.render(width);
+        },
+        invalidate(): void {
+          component.invalidate();
+        },
+        handleInput(data: string): void {
+          component.handleInput(data);
+          tui.requestRender();
+        },
+      };
+    },
+  );
 }
 
 function buildProviderList(ctx: ExtensionContext): Provider[] {
   const availableModels = ctx.modelRegistry.getAvailable();
-  const byProvider = new Map<string, { displayName: string; models: ModelInfo[] }>();
+  const byProvider = new Map<
+    string,
+    { displayName: string; models: ModelInfo[] }
+  >();
 
   for (const model of availableModels) {
     const providerName = model.provider;
@@ -177,7 +208,9 @@ function buildProviderList(ctx: ExtensionContext): Provider[] {
 }
 
 function buildCostLabel(model: Model<Api>): string {
-  const contextLabel = model.contextWindow ? formatContextWindow(model.contextWindow) : "";
+  const contextLabel = model.contextWindow
+    ? formatContextWindow(model.contextWindow)
+    : "";
   const cost = model.cost;
 
   if (!cost) {
@@ -186,9 +219,10 @@ function buildCostLabel(model: Model<Api>): string {
 
   const inputCost = formatPrice(cost.input);
   const outputCost = formatPrice(cost.output);
-  const priceLabel = inputCost === "free" && outputCost === "free"
-    ? "free"
-    : `${inputCost}/${outputCost}`;
+  const priceLabel =
+    inputCost === "free" && outputCost === "free"
+      ? "free"
+      : `${inputCost}/${outputCost}`;
 
   return contextLabel ? `${priceLabel} · ${contextLabel}` : priceLabel;
 }
@@ -225,7 +259,11 @@ function ensureCurrentModelSelected(state: SelectorState): void {
     return;
   }
 
-  for (let providerIndex = 0; providerIndex < state.providers.length; providerIndex++) {
+  for (
+    let providerIndex = 0;
+    providerIndex < state.providers.length;
+    providerIndex++
+  ) {
     const provider = state.providers[providerIndex];
     const modelIndex = provider.models.findIndex(
       (entry) => modelKey(entry.model) === state.currentModelKey,
@@ -239,7 +277,97 @@ function ensureCurrentModelSelected(state: SelectorState): void {
   }
 }
 
-class ModelSelectorComponent {
+/**
+ * Extract filter text from raw terminal input, or undefined for non-text keys.
+ *
+ * Mirrors pi-tui's Input component: decode Kitty CSI-u printable characters
+ * first (they start with ESC), then accept regular printable characters.
+ */
+function decodeFilterText(data: string): string | undefined {
+  const kittyPrintable = decodeKittyPrintable(data);
+  if (kittyPrintable !== undefined) {
+    return isFilterableText(kittyPrintable) ? kittyPrintable : undefined;
+  }
+  return isFilterableText(data) ? data : undefined;
+}
+
+/**
+ * Accept printable characters including Unicode, but reject control characters
+ * (C0: 0x00-0x1F, DEL: 0x7F, C1: 0x80-0x9F) and the Unicode private-use area
+ * (U+E000-U+F8FF), which overlaps the Kitty keyboard protocol's functional-key
+ * codepoints (57344+).
+ */
+function isFilterableText(text: string): boolean {
+  return [...text].every((ch) => {
+    const code = ch.charCodeAt(0);
+    return (
+      code >= 32 &&
+      code !== 0x7f &&
+      !(code >= 0x80 && code <= 0x9f) &&
+      !(code >= 0xe000 && code <= 0xf8ff)
+    );
+  });
+}
+
+/**
+ * Collect models matching `filterText` across all providers.
+ *
+ * Matching is a case-insensitive substring test against the provider display
+ * name, provider name, model name, model id, and `provider/id` key. Results
+ * keep the provider/model sort order of `providers`.
+ */
+export function collectSearchHits(
+  providers: Provider[],
+  filterText: string,
+): SearchHit[] {
+  const query = filterText.trim().toLowerCase();
+  if (!query) {
+    return [];
+  }
+
+  const hits: SearchHit[] = [];
+  for (
+    let providerIndex = 0;
+    providerIndex < providers.length;
+    providerIndex++
+  ) {
+    const provider = providers[providerIndex];
+    for (
+      let modelIndex = 0;
+      modelIndex < provider.models.length;
+      modelIndex++
+    ) {
+      const model = provider.models[modelIndex];
+      const haystack = [
+        provider.displayName,
+        provider.name,
+        model.name,
+        model.model.id,
+        `${provider.name}/${model.model.id}`,
+      ]
+        .join(" ")
+        .toLowerCase();
+      if (haystack.includes(query)) {
+        hits.push({ providerIndex, modelIndex, model });
+      }
+    }
+  }
+  return hits;
+}
+
+/** Offset `index` by `offset`, wrapping around both ends of a `total`-long list. */
+export function wrapIndex(
+  index: number,
+  offset: number,
+  total: number,
+): number {
+  if (total <= 0) {
+    return 0;
+  }
+  return (((index + offset) % total) + total) % total;
+}
+
+export class ModelSelectorComponent {
   private readonly state: SelectorState;
   private readonly theme: Theme;
   private readonly pi: ExtensionAPI;
@@ -250,6 +378,8 @@ class ModelSelectorComponent {
   private cachedLines?: string[];
   private closed = false;
   private selecting = false;
+  private filterText = "";
+  private searchCursor = 0;
 
   constructor(
     state: SelectorState,
@@ -277,6 +407,11 @@ class ModelSelectorComponent {
       return;
     }
 
+    if (this.isFiltering()) {
+      this.handleFilterInput(data);
+      return;
+    }
+
     if (matchesKey(data, Key.tab)) {
       this.moveProvider(1);
       return;
@@ -297,6 +432,13 @@ class ModelSelectorComponent {
       return;
     }
 
+    // Any printable character starts an incremental filter across all providers.
+    const filterText = decodeFilterText(data);
+    if (filterText !== undefined) {
+      this.appendFilterText(filterText);
+      return;
+    }
+
     if (matchesKey(data, Key.enter)) {
       const provider = this.currentProvider();
       const model = provider?.models[this.modelIndex()];
@@ -309,6 +451,51 @@ class ModelSelectorComponent {
 
     if (matchesKey(data, Key.escape)) {
       this.close();
+    }
+  }
+
+  private handleFilterInput(data: string): void {
+    if (matchesKey(data, Key.escape)) {
+      // First Esc clears the filter; pressing Esc again closes the dialog.
+      this.clearFilter();
+      return;
+    }
+
+    if (matchesKey(data, Key.enter)) {
+      const hit = this.searchHits()[this.searchCursor];
+      if (hit) {
+        this.syncSelectionToHit(hit);
+        this.selecting = true;
+        void this.selectModel(hit.model);
+      }
+      return;
+    }
+
+    if (matchesKey(data, Key.up)) {
+      this.moveSearchCursor(-1);
+      return;
+    }
+
+    if (matchesKey(data, Key.down)) {
+      this.moveSearchCursor(1);
+      return;
+    }
+
+    if (matchesKey(data, Key.backspace)) {
+      this.backspaceFilterText();
+      return;
+    }
+
+    if (matchesKey(data, Key.ctrl("u"))) {
+      this.clearFilter();
+      return;
+    }
+
+    // Tab / Shift+Tab are ignored while filtering: the result list already
+    // spans every provider, so provider switching would only hide the results.
+    const filterText = decodeFilterText(data);
+    if (filterText !== undefined) {
+      this.appendFilterText(filterText);
     }
   }
 
@@ -326,6 +513,54 @@ class ModelSelectorComponent {
 
   private setModelIndex(index: number): void {
     this.state.modelIndices[this.state.currentProviderIndex] = index;
+  }
+
+  private isFiltering(): boolean {
+    return this.filterText.length > 0;
+  }
+
+  private searchHits(): SearchHit[] {
+    return collectSearchHits(this.state.providers, this.filterText);
+  }
+
+  private setFilterText(text: string): void {
+    this.filterText = text;
+    this.searchCursor = 0;
+    this.state.lastError = undefined;
+    this.invalidate();
+  }
+
+  private appendFilterText(text: string): void {
+    this.setFilterText(this.filterText + text);
+  }
+
+  private backspaceFilterText(): void {
+    if (this.filterText.length === 0) {
+      return;
+    }
+    this.setFilterText([...this.filterText].slice(0, -1).join(""));
+  }
+
+  private clearFilter(): void {
+    if (this.filterText.length === 0) {
+      return;
+    }
+    this.setFilterText("");
+  }
+
+  private moveSearchCursor(offset: number): void {
+    const total = this.searchHits().length;
+    if (total === 0) {
+      return;
+    }
+    this.searchCursor = wrapIndex(this.searchCursor, offset, total);
+    this.state.lastError = undefined;
+    this.invalidate();
+  }
+
+  private syncSelectionToHit(hit: SearchHit): void {
+    this.state.currentProviderIndex = hit.providerIndex;
+    this.state.modelIndices[hit.providerIndex] = hit.modelIndex;
   }
 
   render(width: number): string[] {
@@ -346,9 +581,16 @@ class ModelSelectorComponent {
       return;
     }
 
-    state.currentProviderIndex = (state.currentProviderIndex + offset + count) % count;
+    state.currentProviderIndex =
+      (state.currentProviderIndex + offset + count) % count;
     const provider = this.currentProvider();
-    this.setModelIndex(clamp(this.modelIndex(), 0, Math.max(0, (provider?.models.length ?? 1) - 1)));
+    this.setModelIndex(
+      clamp(
+        this.modelIndex(),
+        0,
+        Math.max(0, (provider?.models.length ?? 1) - 1),
+      ),
+    );
     state.lastError = undefined;
     this.invalidate();
   }
@@ -359,7 +601,9 @@ class ModelSelectorComponent {
       return;
     }
 
-    this.setModelIndex(clamp(this.modelIndex() + offset, 0, provider.models.length - 1));
+    this.setModelIndex(
+      wrapIndex(this.modelIndex(), offset, provider.models.length),
+    );
     this.state.lastError = undefined;
     this.invalidate();
   }
@@ -376,60 +620,188 @@ class ModelSelectorComponent {
     }
 
     const innerWidth = clampedWidth - 2;
-    const provider = this.currentProvider();
-    const visibleRange = provider
-      ? this.visibleModelRange(provider.models.length)
-      : { start: 0, end: -1 };
 
     const lines: string[] = [];
     lines.push(this.frameTop(clampedWidth));
     lines.push(this.frameLine(this.headerLine(innerWidth), innerWidth));
-    lines.push(this.frameLine(this.providerStrip(innerWidth), innerWidth));
-    lines.push(this.frameLine(this.providerMetaLine(innerWidth, provider), innerWidth));
-    lines.push(this.frameLine(this.summaryLine(innerWidth, provider, visibleRange), innerWidth));
-    lines.push(this.frameDivider(clampedWidth));
 
-    if (provider) {
-      lines.push(this.frameLine(this.sectionTitle("Models"), innerWidth));
-      lines.push(this.frameLine(this.tableHeader(innerWidth), innerWidth));
-
-      if (provider.models.length === 0) {
-        lines.push(this.frameLine(this.muted("No models available for this provider"), innerWidth));
-      } else {
-        if (visibleRange.start > 0) {
-          lines.push(this.frameLine(this.dim(`↑ ${visibleRange.start} more above`), innerWidth));
-        }
-
-        for (let index = visibleRange.start; index <= visibleRange.end; index++) {
-          const model = provider.models[index];
-          const isActive = modelKey(model.model) === this.state.currentModelKey;
-          const isSelected = index === this.modelIndex();
-          lines.push(this.frameLine(this.modelRow(model, isActive, isSelected, innerWidth), innerWidth));
-        }
-
-        const below = provider.models.length - visibleRange.end - 1;
-        if (below > 0) {
-          lines.push(this.frameLine(this.dim(`↓ ${below} more below`), innerWidth));
-        }
-      }
-
-      lines.push(this.frameDivider(clampedWidth));
-      lines.push(this.frameLine(this.sectionTitle("Selection"), innerWidth));
-      for (const detailLine of this.detailLines(provider, innerWidth)) {
-        lines.push(this.frameLine(detailLine, innerWidth));
-      }
+    if (this.isFiltering()) {
+      this.appendSearchBody(lines, clampedWidth, innerWidth);
+    } else {
+      this.appendProviderBody(lines, clampedWidth, innerWidth);
     }
 
     if (this.state.lastError) {
       lines.push(this.frameDivider(clampedWidth));
-      lines.push(this.frameLine(this.warning(`Failed: ${this.state.lastError}`), innerWidth));
+      lines.push(
+        this.frameLine(
+          this.warning(`Failed: ${this.state.lastError}`),
+          innerWidth,
+        ),
+      );
     }
 
     lines.push(this.frameDivider(clampedWidth));
     lines.push(this.frameLine(this.helpLine(innerWidth), innerWidth));
     lines.push(this.frameBottom(clampedWidth));
 
-    return lines.map((line) => this.theme.bg("customMessageBg", truncateToWidth(line, clampedWidth, "")));
+    return lines.map((line) =>
+      this.theme.bg("customMessageBg", truncateToWidth(line, clampedWidth, "")),
+    );
+  }
+
+  private appendProviderBody(
+    lines: string[],
+    width: number,
+    innerWidth: number,
+  ): void {
+    const provider = this.currentProvider();
+    const visibleRange = provider
+      ? this.visibleModelRange(provider.models.length)
+      : { start: 0, end: -1 };
+
+    lines.push(this.frameLine(this.providerStrip(innerWidth), innerWidth));
+    lines.push(
+      this.frameLine(this.providerMetaLine(innerWidth, provider), innerWidth),
+    );
+    lines.push(
+      this.frameLine(
+        this.summaryLine(innerWidth, provider, visibleRange),
+        innerWidth,
+      ),
+    );
+    lines.push(this.frameDivider(width));
+
+    if (provider) {
+      lines.push(this.frameLine(this.sectionTitle("Models"), innerWidth));
+      lines.push(this.frameLine(this.tableHeader(innerWidth), innerWidth));
+
+      if (provider.models.length === 0) {
+        lines.push(
+          this.frameLine(
+            this.muted("No models available for this provider"),
+            innerWidth,
+          ),
+        );
+      } else {
+        if (visibleRange.start > 0) {
+          lines.push(
+            this.frameLine(
+              this.dim(`↑ ${visibleRange.start} more above`),
+              innerWidth,
+            ),
+          );
+        }
+
+        for (
+          let index = visibleRange.start;
+          index <= visibleRange.end;
+          index++
+        ) {
+          const model = provider.models[index];
+          const isActive = modelKey(model.model) === this.state.currentModelKey;
+          const isSelected = index === this.modelIndex();
+          lines.push(
+            this.frameLine(
+              this.modelRow(model, isActive, isSelected, innerWidth),
+              innerWidth,
+            ),
+          );
+        }
+
+        const below = provider.models.length - visibleRange.end - 1;
+        if (below > 0) {
+          lines.push(
+            this.frameLine(this.dim(`↓ ${below} more below`), innerWidth),
+          );
+        }
+      }
+
+      lines.push(this.frameDivider(width));
+      lines.push(this.frameLine(this.sectionTitle("Selection"), innerWidth));
+      const selected = provider.models[this.modelIndex()];
+      const positionLabel = `model ${this.modelIndex() + 1}/${provider.models.length}`;
+      for (const detailLine of this.detailLines(
+        provider,
+        selected,
+        positionLabel,
+        innerWidth,
+      )) {
+        lines.push(this.frameLine(detailLine, innerWidth));
+      }
+    }
+  }
+
+  private appendSearchBody(
+    lines: string[],
+    width: number,
+    innerWidth: number,
+  ): void {
+    const hits = this.searchHits();
+
+    lines.push(
+      this.frameLine(this.filterLine(innerWidth, hits.length), innerWidth),
+    );
+    lines.push(this.frameDivider(width));
+    lines.push(this.frameLine(this.sectionTitle("Search results"), innerWidth));
+    lines.push(this.frameLine(this.tableHeader(innerWidth), innerWidth));
+
+    if (hits.length === 0) {
+      lines.push(
+        this.frameLine(
+          this.muted(`No models match "${this.filterText.trim()}"`),
+          innerWidth,
+        ),
+      );
+    } else {
+      const visibleRange = this.visibleRangeFor(this.searchCursor, hits.length);
+
+      if (visibleRange.start > 0) {
+        lines.push(
+          this.frameLine(
+            this.dim(`↑ ${visibleRange.start} more above`),
+            innerWidth,
+          ),
+        );
+      }
+
+      for (let index = visibleRange.start; index <= visibleRange.end; index++) {
+        const hit = hits[index];
+        const isSelected = index === this.searchCursor;
+        lines.push(
+          this.frameLine(
+            this.searchRow(hit, isSelected, innerWidth),
+            innerWidth,
+          ),
+        );
+      }
+
+      const below = hits.length - visibleRange.end - 1;
+      if (below > 0) {
+        lines.push(
+          this.frameLine(this.dim(`↓ ${below} more below`), innerWidth),
+        );
+      }
+    }
+
+    lines.push(this.frameDivider(width));
+    lines.push(this.frameLine(this.sectionTitle("Selection"), innerWidth));
+
+    const hit = hits[this.searchCursor];
+    if (hit) {
+      const provider = this.state.providers[hit.providerIndex];
+      const positionLabel = `result ${this.searchCursor + 1}/${hits.length}`;
+      for (const detailLine of this.detailLines(
+        provider,
+        hit.model,
+        positionLabel,
+        innerWidth,
+      )) {
+        lines.push(this.frameLine(detailLine, innerWidth));
+      }
+    } else {
+      lines.push(this.frameLine(this.muted("No model selected"), innerWidth));
+    }
   }
 
   private renderTooNarrow(width: number): string[] {
@@ -437,20 +809,42 @@ class ModelSelectorComponent {
     const innerWidth = Math.max(0, safeWidth - 2);
     const lines = [
       this.frameTop(safeWidth),
-      this.frameLine(this.styled("accent", this.bold("Model Selector")), innerWidth),
-      this.frameLine(this.warning(`Window too narrow (${safeWidth} cols)`), innerWidth),
-      this.frameLine(this.dim(`Resize to at least ${MIN_DIALOG_WIDTH} columns`), innerWidth),
+      this.frameLine(
+        this.styled("accent", this.bold("Model Selector")),
+        innerWidth,
+      ),
+      this.frameLine(
+        this.warning(`Window too narrow (${safeWidth} cols)`),
+        innerWidth,
+      ),
+      this.frameLine(
+        this.dim(`Resize to at least ${MIN_DIALOG_WIDTH} columns`),
+        innerWidth,
+      ),
       this.frameBottom(safeWidth),
     ];
-    return lines.map((line) => this.theme.bg("customMessageBg", truncateToWidth(line, safeWidth, "")));
+    return lines.map((line) =>
+      this.theme.bg("customMessageBg", truncateToWidth(line, safeWidth, "")),
+    );
   }
 
   private headerLine(width: number): string {
     return twoColumn(
       this.styled("accent", this.bold("Model Selector")),
-      this.dim(`${this.state.providers.length} provider${this.state.providers.length === 1 ? "" : "s"}`),
+      this.dim(
+        `${this.state.providers.length} provider${this.state.providers.length === 1 ? "" : "s"}`,
+      ),
       width,
     );
+  }
+
+  private filterLine(width: number, hitCount: number): string {
+    const label = this.styled("accent", this.bold("Filter"));
+    const cursor = this.theme.inverse(" ");
+    const matchLabel = this.dim(
+      `${hitCount} match${hitCount === 1 ? "" : "es"}`,
+    );
+    return twoColumn(`${label} ${this.filterText}${cursor}`, matchLabel, width);
   }
 
   private providerStrip(width: number): string {
@@ -461,7 +855,9 @@ class ModelSelectorComponent {
       return "";
     }
 
-    const fullSegments = providers.map((provider, index) => this.providerLabel(provider, index, index === currentIndex));
+    const fullSegments = providers.map((provider, index) =>
+      this.providerLabel(provider, index, index === currentIndex),
+    );
     const fullLine = fullSegments.join(" ");
     if (visibleWidth(fullLine) <= width) {
       return fullLine;
@@ -474,21 +870,37 @@ class ModelSelectorComponent {
     if (hiddenLeft > 1) {
       segments.push(this.dim(`← ${hiddenLeft} more`));
     } else if (hiddenLeft === 1) {
-      segments.push(this.providerLabel(providers[currentIndex - 1], currentIndex - 1, false));
+      segments.push(
+        this.providerLabel(
+          providers[currentIndex - 1],
+          currentIndex - 1,
+          false,
+        ),
+      );
     }
 
     segments.push(this.providerLabel(current, currentIndex, true));
 
     if (hiddenRight === 1) {
-      segments.push(this.providerLabel(providers[currentIndex + 1], currentIndex + 1, false));
+      segments.push(
+        this.providerLabel(
+          providers[currentIndex + 1],
+          currentIndex + 1,
+          false,
+        ),
+      );
     } else if (hiddenRight > 1) {
-      segments.push(this.dim(`${hiddenRight} more →`));
+      segments.push(this.dim(`${hiddenRight} more ->`));
     }
 
     return fitSegments(segments, width);
   }
 
-  private providerLabel(provider: Provider, index: number, isCurrent: boolean): string {
+  private providerLabel(
+    provider: Provider,
+    index: number,
+    isCurrent: boolean,
+  ): string {
     const label = ` ${index + 1}. ${provider.displayName} `;
     if (isCurrent) {
       return this.theme.inverse(this.styled("accent", this.bold(label)));
@@ -496,14 +908,21 @@ class ModelSelectorComponent {
     return this.muted(label);
   }
 
-  private providerMetaLine(width: number, provider: Provider | undefined): string {
+  private providerMetaLine(
+    width: number,
+    provider: Provider | undefined,
+  ): string {
     if (!provider) {
       return this.muted("No provider selected");
     }
 
     return twoColumn(
-      this.dim(`Provider ${this.state.currentProviderIndex + 1}/${this.state.providers.length} • ${provider.displayName}`),
-      this.dim(`${provider.models.length} model${provider.models.length === 1 ? "" : "s"}`),
+      this.dim(
+        `Provider ${this.state.currentProviderIndex + 1}/${this.state.providers.length} • ${provider.displayName}`,
+      ),
+      this.dim(
+        `${provider.models.length} model${provider.models.length === 1 ? "" : "s"}`,
+      ),
       width,
     );
   }
@@ -518,11 +937,15 @@ class ModelSelectorComponent {
     }
 
     const total = provider.models.length;
-    const modelPosition = total === 0 ? "0/0" : `${this.modelIndex() + 1}/${total}`;
-    const visibleLabel = total === 0
-      ? "0/0"
-      : `${visibleRange.start + 1}-${visibleRange.end + 1}/${total}`;
-    const activeLabel = this.state.currentModelKey?.startsWith(`${provider.name}/`)
+    const modelPosition =
+      total === 0 ? "0/0" : `${this.modelIndex() + 1}/${total}`;
+    const visibleLabel =
+      total === 0
+        ? "0/0"
+        : `${visibleRange.start + 1}-${visibleRange.end + 1}/${total}`;
+    const activeLabel = this.state.currentModelKey?.startsWith(
+      `${provider.name}/`,
+    )
       ? this.styled("success", "active in provider")
       : this.dim("active elsewhere");
 
@@ -543,13 +966,23 @@ class ModelSelectorComponent {
     return `${padVisible(this.dim("MARK MODEL"), nameWidth)} ${alignRight(this.dim("PRICE / CONTEXT"), priceWidth)}`;
   }
 
-  private modelRow(model: ModelInfo, isActive: boolean, isSelected: boolean, width: number): string {
+  private modelRow(
+    model: ModelInfo,
+    isActive: boolean,
+    isSelected: boolean,
+    width: number,
+    providerTag?: string,
+  ): string {
     const nameWidth = this.nameColumnWidth(width);
     const priceWidth = this.priceColumnWidth(width);
 
-    const selectedMark = isSelected ? this.styled("accent", "›") : this.dim(" ");
+    const selectedMark = isSelected
+      ? this.styled("accent", "›")
+      : this.dim(" ");
     const activeMark = isActive ? this.styled("success", "●") : this.dim("·");
-    const reasoningMark = model.reasoning ? this.styled("warning", "R") : this.dim("·");
+    const reasoningMark = model.reasoning
+      ? this.styled("warning", "R")
+      : this.dim("·");
     const markers = `${selectedMark}${activeMark}${reasoningMark}`;
 
     let nameColor: ThemeColor = "text";
@@ -561,18 +994,54 @@ class ModelSelectorComponent {
 
     // Colour the name on its own: `markers` already closes its own colour spans,
     // so wrapping both together would reset the name back to the default colour.
-    const nameText = truncateToWidth(model.name, Math.max(0, nameWidth - MARKER_WIDTH - 1));
-    const leftText = `${markers} ${this.styled(nameColor, nameText)}`;
+    const budget = Math.max(0, nameWidth - MARKER_WIDTH - 1);
+    let tag = "";
+    if (providerTag !== undefined) {
+      tag = this.dim(
+        truncateToWidth(
+          providerTag,
+          Math.max(0, Math.floor(budget * 0.45)),
+          "",
+        ),
+      );
+    }
+    const nameBudget = tag
+      ? Math.max(0, budget - visibleWidth(tag) - 1)
+      : budget;
+    const nameText = truncateToWidth(model.name, nameBudget);
+    const leftText = `${markers} ${tag ? `${tag} ` : ""}${this.styled(nameColor, nameText)}`;
     const left = padVisible(leftText, nameWidth);
     const rightText = truncateToWidth(model.cost, priceWidth);
     const right = alignRight(this.dim(rightText), priceWidth);
     const line = `${left} ${right}`;
 
-    return isSelected ? this.theme.bg("selectedBg", padVisible(line, width)) : line;
+    return isSelected
+      ? this.theme.bg("selectedBg", padVisible(line, width))
+      : line;
   }
 
-  private detailLines(provider: Provider, width: number): string[] {
-    const model = provider.models[this.modelIndex()];
+  private searchRow(
+    hit: SearchHit,
+    isSelected: boolean,
+    width: number,
+  ): string {
+    const isActive = modelKey(hit.model.model) === this.state.currentModelKey;
+    const provider = this.state.providers[hit.providerIndex];
+    return this.modelRow(
+      hit.model,
+      isActive,
+      isSelected,
+      width,
+      provider?.displayName,
+    );
+  }
+
+  private detailLines(
+    provider: Provider,
+    model: ModelInfo | undefined,
+    positionLabel: string,
+    width: number,
+  ): string[] {
     if (!model) {
       return [this.muted("No model selected")];
     }
@@ -586,7 +1055,6 @@ class ModelSelectorComponent {
       capability = this.styled("warning", "Reasoning capable");
     }
 
-    const selectedPosition = `${this.modelIndex() + 1}/${provider.models.length}`;
     const markerSummary = [
       this.styled("accent", "› selected"),
       this.styled("success", "● active"),
@@ -595,21 +1063,36 @@ class ModelSelectorComponent {
 
     return [
       twoColumn(this.bold(model.name), status, width),
-      twoColumn(this.dim(`${provider.displayName} • model ${selectedPosition}`), capability, width),
+      twoColumn(
+        this.dim(`${provider.displayName} • ${positionLabel}`),
+        capability,
+        width,
+      ),
       this.dim(`${provider.name}/${model.model.id}`),
-      twoColumn(this.dim("Price / context"), this.bold(this.dim(model.cost)), width),
+      twoColumn(
+        this.dim("Price / context"),
+        this.bold(this.dim(model.cost)),
+        width,
+      ),
       markerSummary,
     ];
   }
 
   private helpLine(width: number): string {
-    return centerText(
-      this.dim("Tab/Shift+Tab provider • ↑↓ move • Enter select • Esc cancel"),
-      width,
-    );
+    const hint = this.isFiltering()
+      ? "↑↓ move • Backspace edit • Ctrl+U clear • Enter select • Esc clear filter"
+      : "Tab/Shift+Tab provider • ↑↓ move • type to filter • Enter select • Esc cancel";
+    return centerText(this.dim(hint), width);
   }
 
   private visibleModelRange(total: number): { start: number; end: number } {
+    return this.visibleRangeFor(this.modelIndex(), total);
+  }
+
+  private visibleRangeFor(
+    cursor: number,
+    total: number,
+  ): { start: number; end: number } {
     if (total <= 0) {
       return { start: 0, end: -1 };
     }
@@ -619,7 +1102,7 @@ class ModelSelectorComponent {
     }
 
     const half = Math.floor(MODEL_ROWS / 2);
-    const start = clamp(this.modelIndex() - half, 0, total - MODEL_ROWS);
+    const start = clamp(cursor - half, 0, total - MODEL_ROWS);
     return { start, end: start + MODEL_ROWS - 1 };
   }
 
@@ -713,12 +1196,16 @@ function clamp(value: number, min: number, max: number): number {
 
 function padVisible(text: string, width: number): string {
   const remaining = width - visibleWidth(text);
-  return remaining > 0 ? `${text}${" ".repeat(remaining)}` : truncateToWidth(text, width, "");
+  return remaining > 0
+    ? `${text}${" ".repeat(remaining)}`
+    : truncateToWidth(text, width, "");
 }
 
 function alignRight(text: string, width: number): string {
   const remaining = width - visibleWidth(text);
-  return remaining > 0 ? `${" ".repeat(remaining)}${text}` : truncateToWidth(text, width, "");
+  return remaining > 0
+    ? `${" ".repeat(remaining)}${text}`
+    : truncateToWidth(text, width, "");
 }
 
 function centerText(text: string, width: number): string {
